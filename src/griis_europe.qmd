@@ -1,0 +1,419 @@
+---
+title: "GRIIS - Europe"
+format:
+  html:
+    df-print: paged
+    toc: true
+    toc-float: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-tools: true
+execute:
+  eval: true
+  echo: true
+  warning: true
+  error: false
+  include: true
+project:
+  execute-dir: project
+output-dir: docs
+from: markdown+emoji
+editor: source
+---
+
+## Intro
+
+This pipeline retrieves GRIIS checklists of (some) European countries to build an European GRIIS checklist. It is based on the [workflow](https://trias-project.github.io/unified-checklist/) for generating the GRIIS Belgium checklist.
+
+```{r load_pkgs, message=FALSE, warning=FALSE}
+library(rgbif)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(readr)
+library(here)
+library(janitor)
+```
+
+## Choose checklists
+
+1.  Choose GRIIS national checklists to include in the European checklist:
+
+```{r choose_checklists}
+checklist_keys <- c(
+  "a811c07f-206d-46b8-ad59-93af4e2ce7c0", # Luxembourg
+  "692a0aec-70e2-4038-ac9c-9a1d7acc025f", # France
+  "ad5cba8c-45fb-428c-aafa-7ff013d0fdaf" # Denmark
+)
+```
+
+Countries:
+
+```{r}
+countries <- c("LU", "FR", "DK")
+```
+
+
+2.  Add the [GBIF Backbone Taxonomy](https://doi.org/10.15468/39omei). **Note**: we won't use this as a source checklist, but we need its metadata in the Darwin Core mapping.
+
+```{r add_backbone}
+checklist_keys <- append(checklist_keys, "d7dddbf4-2cf0-4f39-9b2a-bb099caae36c")
+```
+
+3.  Get metadata for these checklists from GBIF and display the result:
+
+```{r get_taxa-get_checklist_metadata_from_gbif}
+#| cache: true
+checklists <-
+  map(checklist_keys, function(x) rgbif::dataset_get(uuid = x)) %>%
+  map_df(function(x) list(
+      datasetKey = x$key,
+      title = x$title,
+      modified = x$modified,
+      publisher = x$publishingOrganizationKey,
+      doi = paste0("https://doi.org/", x$doi),
+      citation = x$citation[[1]]$text,
+      license = x$license
+    ))
+checklists
+```
+
+4.  Remove `accessed via GBIF.org on yyyy-mm-dd.` from citation (we want the static citation of the dataset).
+
+```{r cleanup_citation}
+checklists <-
+  checklists %>% mutate(citation = str_remove(citation, " accessed via GBIF.org on \\d+-\\d+-\\d+."))
+```
+
+5.  Save to [CSV](https://github.com/damianooldoni/griis-eu/blob/master/data/raw/checklists.csv).
+
+```{r write_checklists_metadata}
+write_csv(checklists, here::here("data", "raw", "checklists.csv"), na = "")
+```
+
+6.  Remove the GBIF Backbone Taxonomy from further querying steps.
+
+```{r remove_backbone}
+checklists <- head(checklists, -1)
+```
+
+## Get taxa
+
+1.  Get taxa from these checklists from GBIF. **Note**: here we get *checklist taxa*, not *GBIF backbone taxa*.
+
+```{r get_taxa-get_checklist_taxa_from_gbif}
+#| cache: true
+taxa <-
+  map_df(checklists$datasetKey, function(x) {
+    rgbif::name_usage(
+      datasetKey = x,
+      limit = 99999 # Should be more than total taxa for all checklists
+    )$data
+  })
+```
+
+2.  Keep only source taxa, not denormed higher classification taxa (= taxa added by GBIF if `kingdom`, `phylum`, etc. was populated)
+
+```{r get-taxa-6}
+taxa <-
+  taxa %>%
+  filter(origin == "SOURCE")
+```
+
+3.  Keep only taxa that are not considered synonyms by source checklist. **To be checked!**
+
+```{r get-taxa-7}
+taxa <-
+  taxa %>%
+  filter(taxonomicStatus %in% c("ACCEPTED", "DOUBTFUL"))
+```
+
+4.  Select columns of interest, rename `key` to `taxonKey`.
+
+```{r get_taxa-8}
+taxa <-
+  taxa %>%
+  select(key, scientificName, taxonID, datasetKey, nameType, issues, nubKey) %>%
+  rename(taxonKey = key)
+```
+
+5.  Fix `scientificName` spelling issues (i.e. double quotes).
+
+```{r get_taxa-9}
+taxa <-
+  taxa %>%
+  mutate(
+    scientificName = str_replace_all(scientificName, "\"", "'")
+  )
+```
+
+6.  Preview checklist taxa:
+
+```{r get_taxa-10}
+taxa %>% head()
+```
+
+## Get distributions
+
+1. Get distributions for our taxa from GBIF.
+
+```{r get_taxa-get_distributions_from_gbif, cache = TRUE, message = FALSE}
+# Extract taxonKeys as a vector
+taxon_keys <-
+  taxa %>%
+  pull(taxonKey)
+
+# Get distributions
+distributions <-
+    map_dfr(
+      taxon_keys,
+      function(x) {
+        rgbif::name_usage(
+          key = x,
+          data = "distribution"
+        )$data
+      },
+      .progress = TRUE
+    )
+```
+
+2. Filter distributions on present, alien species in the given countries. **Note**: maybe the checks should be done via a function? Notice also that the status column in GRIIS Belgium is not found in the checklists used here.
+
+```{r get_taxa-11, echo = TRUE}
+not_in_countries <- distributions %>%
+  dplyr::filter(!country %in% countries)
+if (nrow(not_in_countries) > 0) {
+  warning(
+    paste(
+      "The following taxa (`taxonKey`) have distributions ouf of the list of countries:",
+      paste(unique(not_in_countries$taxonKey),
+            collapse = ", ")
+    )
+  )
+}
+not_alien <- distributions %>%
+  dplyr::filter(!establishmentMeans %in% c("INTRODUCED", "NATURALISED", "INVASIVE", "ASSISTED COLONISATION"))
+if (nrow(not_alien) > 0) {
+  warning(
+    paste(
+      "The following taxa (`taxonKey`) have distributions that are not alien:",
+      paste(unique(not_alien$taxonKey),
+            collapse = ", ")
+    )
+  )
+}
+
+distributions <-
+  distributions %>%
+  filter(
+    country %in% countries,
+    establishmentMeans %in% c("INTRODUCED", "NATURALISED", "INVASIVE", "ASSISTED COLONISATION")
+  )
+```
+
+3. Save distributions to [CSV](https://github.com/damianooldoni/griis-eu/blob/master/data/raw/distributions.csv).
+
+```{r get_taxa-12}
+write_csv(distributions, here("data", "raw", "distributions.csv"), na = "")
+```
+
+## Unify taxa
+
+1. Remove taxa without match with GBIF Backbone (missing `nubKey`).
+
+```{r taxa_with_match}
+taxa_unified <-
+  taxa %>%
+  filter(!is.na(nubKey))
+```
+
+2. Group taxa by `nubKey`, saving the `datasetKey` and `taxonKey` of the taxa that are bundled per key in `datasetKeys` and `taxonKeys`.
+
+```{r group_by_nubkey}
+taxa_unified <-
+  taxa_unified %>%
+  # Group by nubKey across and within checklists
+  dplyr::group_by(nubKey) %>%
+
+  # Note contained checklists and taxa
+  dplyr::summarize(
+    datasetKeys = paste(unique(datasetKey), collapse = "|"),
+    taxonKeys = paste(unique(taxonKey), collapse = "|")
+  )
+```
+
+5. Extract `nubKey` as a vector.
+
+```{r extract_nubKey}
+nub_keys <-
+  taxa_unified %>%
+  dplyr::pull(nubKey)
+```
+
+6. Number of unique taxa: `r length(nub_keys)`.
+
+## Get GBIF backbone taxonomy information
+
+1. Retrieve GBIF Backbone taxonomy information from GBIF for the taxa in our checklist.
+
+```{r unify_taxa-get_backbone_info_from_gbif, cache = TRUE, message = FALSE}
+backbone_info <-
+  purrr::map_dfr(
+    nub_keys,
+    function(x) {
+      rgbif::name_usage(
+        key = x
+      )$data
+    },
+    .progress = TRUE
+  )
+```
+
+2. Rename `accepted` to `acceptedName`.
+
+```{r unify_taxa-6}
+backbone_info <-
+  backbone_info %>%
+  dplyr::rename(acceptedName = accepted)
+```
+
+3. Select columns of interest.
+
+```{r unify_taxa-7}
+backbone_info <-
+  backbone_info %>%
+  dplyr::select(
+    "key",
+    "scientificName",
+    "nameKey",
+    "taxonID",
+    "kingdom",
+    "phylum",
+    "class",
+    "order",
+    "family",
+    "genus",
+    "species",
+    "datasetKey",
+    "parentKey",
+    "parent",
+    "canonicalName",
+    "authorship",
+    "nameType",
+    "rank",
+    "taxonomicStatus",
+    "acceptedKey",
+    "acceptedName"
+  )
+```
+
+4. Join backbone information with our unified taxa
+```{r unify_taxa-8}
+taxa_unified <-
+  taxa_unified %>%
+  dplyr::left_join(
+    backbone_info,
+    by = c("nubKey" = "key")
+  )
+```
+
+5. Move columns `datasetKeys` and `taxonKeys` to the end.
+
+```{r unify_taxa-9}
+taxa_unified <-
+  taxa_unified %>%
+  dplyr::relocate(datasetKeys, taxonKeys, .after = last_col())
+```
+
+6. Preview merged information:
+
+```{r unify_taxa-10}
+taxa_unified %>% head()
+```
+
+7. Number of taxa: `r nrow(taxa_unified)`
+
+8. Save to [CSV](https://github.com/damianooldoni/griis-eu/blob/master/data/interim/taxa_unified.csv).
+
+```{r unify_taxa-12}
+write_csv(taxa_unified, here::here("data", "interim", "taxa_unified.csv"), na = "")
+```
+
+## Unify distribution
+
+Unifying the distribution is actually trivial if all GRIIS checklists encode the same information in the same format. All steps in 
+
+1. Remove distributions not related to taxa in `taxa_unified`, i.e. taxa without match with GBIF Backbone.
+
+```{r distributions_with_match}
+distributions_unified <-
+  distributions %>%
+  filter(taxonKey %in% taxa_unified$taxonKey)
+```
+
+2. Save to [CSV](https://github.com/damianooldoni/griis-eu/blob/master/data/interim/distributions_unified.csv).
+
+```{r unify_information-9}
+write_csv(distributions_unified, here("data", "interim", "distributions_unified.csv"), na = "")
+```
+
+## Darwin Core mapping
+
+we can now standardize the unified information to a Darwin Core checklist that can be harvested by GBIF.
+
+1. Preview the unified information.
+
+2. Number of rows per file and corresponding mapping section in this chapter:
+
+File | Number of rows
+--- | ---
+taxa | `r nrow(taxa_unified)`
+distributions | `r nrow(distributions_unified)`
+
+3. Number of taxa per checklist:
+
+```{r dwc_mapping-2}
+taxa_unified %>%
+
+  # Separate datasetKeys on "|" in as many columns as there are checklists
+  separate(
+    datasetKeys,
+    into = c(paste("source", 1:nrow(checklists), sep = "_")),
+    sep = "\\|",
+    remove = FALSE,
+    fill = "right"
+  ) %>%
+
+  # Add column whether contributing source is unique
+  mutate(unique_shared = case_when(
+    is.na(source_2) ~ "unique", # If there is no second source, it is unique
+    TRUE ~ "shared"
+  )) %>%
+
+  # Gather to one row per source (multiple rows)
+  gather(
+    key = position,
+    value = source,
+    paste("source", 1:nrow(checklists), sep = "_"),
+    na.rm = TRUE,
+    convert = FALSE
+  ) %>%
+
+  # Group by source dataset and whether it is unique or not
+  group_by(source, unique_shared) %>%
+  summarize(count = n()) %>%
+
+  # Create count per column shared vs unique
+  spread(unique_shared, count) %>%
+  ungroup() %>%
+  rename(datasetKey = source) %>%
+
+  # Join with checklist information (right join to get checklist order)
+  right_join(
+    checklists,
+    by = "datasetKey"
+  ) %>%
+  select(doi, unique, shared, title, datasetKey) %>%
+  adorn_totals("row")
+```
